@@ -1,0 +1,347 @@
+---
+title: "Fuzzy address matching"
+output:
+  word_document: default
+  pdf_document: default
+---
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+
+This program takes in a CSV file containing a list of client addresses and checks them against two different data sets to determine which locations our company services. It then retrieves the data pertaining to those locations. Due to the wide variety of address naming conventions used by clients, as well as potential misspellings, fuzzy matching is employed as an option.
+
+The program first reads in the three data sets, subsets the addresses, and then breaks the data up based on states for processing. This approach helps to deal with larger data sets when local machines encounter memory problems. Next, the program cleans the data to a standard format, performs exact matching based on zip code and address number, and finally employs fuzzy matching on the address portion to handle misspellings. The fuzzy match uses the Levenshtein distance, which users can manually adjust.
+
+Please note that, in order to increase efficiency, I have incorporated checks to see if the two company datasets have already been loaded. If so, it also checks if the data has been cleaned already. This prevents the program from loading and cleaning the data multiple times while changing the client file throughout the day.
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+Load libraries and set working directory
+```{r}
+library(tidyverse)
+library(fuzzyjoin)
+library(readr)
+library(readxl)
+library(data.table)
+library(stringr)
+library(dplyr)
+library(styler)
+setwd("C:/Users/ivan.yuen/Documents/R/")
+```
+
+
+Read in relevant files and subset data for matching purposes
+```{r}
+# First check if PP or iRIS files has been processed already, and prompt to select unprocessed files
+
+# Function to check if files exist and match a specific pattern
+check_files_exist <- function(folder, pattern) {
+  if (!dir.exists(folder)) {
+    return(FALSE)
+  }
+
+  files <- list.files(folder, pattern = pattern, recursive = TRUE)
+  length(files) > 0
+}
+
+# Set folder paths
+pp_folder <- "C:/Users/ivan.yuen/Documents/R/PP states"
+iris_folder <- "C:/Users/ivan.yuen/Documents/R/iRIS states"
+
+# Check if the PP and iRIS state folders exist, create them if not
+if (!dir.exists(pp_folder)) {
+  dir.create(pp_folder)
+}
+
+if (!dir.exists(iris_folder)) {
+  dir.create(iris_folder)
+}
+
+# Check if the PP and iRIS state files exist
+pp_files_exist <- check_files_exist(pp_folder, pattern = "*.csv")
+iris_files_exist <- check_files_exist(iris_folder, pattern = "*.csv")
+
+# Check if pp_all_active and iris_all_active have been read in
+pp_all_active_exists <- exists("pp_all_active")
+iris_all_active_exists <- exists("iris_all_active")
+
+# Prompt user to choose files if state files don't exist
+if (!pp_all_active_exists) {
+  pp_path <- choose.files(
+    default = "C:/Users/ivan.yuen/Documents/R/Input files",
+    caption = "Choose PestPac All Active file"
+  )
+  # Check file encoding, read file, then subset out matching columns to perform work on
+  pp_encoding <- guess_encoding(pp_path)
+  pp_all_active <- read_csv(pp_path, locale = locale(encoding = pp_encoding$encoding[[1]]))
+  pp_all_active <- mutate(pp_all_active, row_number = row_number())
+  pp_address <- pp_all_active %>%
+    select(Address, City, State, Zip, row_number)
+} else {
+  message("PestPac all active found. Skipping file selection.")
+}
+
+if (!iris_all_active_exists) {
+  iris_path <- choose.files(
+    default = "C:/Users/ivan.yuen/Documents/R/Input files",
+    caption = "Choose iRIS All Active file"
+  )
+  # Check file encoding, read file, then subset out matching columns to perform work on
+  iris_encoding <- guess_encoding(iris_path)
+  iris_all_active <- data.table(read_csv(iris_path, locale = locale(encoding = iris_encoding$encoding[[1]])))
+  iris_all_active <- mutate(iris_all_active, row_number = row_number())
+  iris_address <- iris_all_active %>%
+    mutate(
+      Address = WKSADDR1, WKSZIP = format(as.numeric(WKSZIP),
+        big.mark = "",
+        scientific = FALSE
+      ),
+      Zip = WKSZIP, City = WKSCITY, State = WKSSTATE
+    ) %>%
+    select(Address, City, State, Zip, row_number)
+} else {
+  message("iRIS all active found. Skipping file selection.")
+}
+
+
+client_path <- choose.files(
+  default = "C:/Users/ivan.yuen/Documents/R/Input files",
+  caption = "Choose client file"
+)
+client_encoding <- guess_encoding(client_path)
+client <- read_csv(client_path, locale = locale(encoding = client_encoding$encoding[[1]]))
+client_address <- client %>% select(Address, City, State, Zip)
+```
+
+Define function to split files based on column name
+```{r}
+split_data_by_state <- function(data, column_name, folder_name) {
+  # Create a new folder to store the state/region-specific CSV files
+  if (!file.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+
+  value_folder_path <- file.path(folder_name)
+
+  # Get unique values in the specified column
+  unique_values <- unique(data[[column_name]])
+
+  # Loop through each unique value and file for each
+  for (value in unique_values) {
+    # Create a subset of the data for the current value
+    value_data <- subset(data, data[[column_name]] == value)
+
+    # Define the file path for the output file in the value-specific folder
+    file_path <- file.path(value_folder_path, paste0(value, ".csv"))
+
+    # Write the value-specific data to a new CSV file
+    write_csv(value_data, file_path)
+  }
+}
+```
+
+call split function to break down file size based on state
+```{r}
+if (!pp_files_exist || !iris_files_exist) {
+  split_data_by_state(pp_address, "State", "PP states")
+  split_data_by_state(iris_address, "State", "iRIS states")
+}
+
+split_data_by_state(client_address, "State", "Client states")
+```
+
+
+Define function to clean data to a set standard 
+```{r}
+clean_data <- function(data) {
+  # Vector used for fixing address prefix and suffix for consistency
+  address_fix <- c(
+    " BOULEVARD" = " BLVD", " SUITE" = " STE", " HIGHWAY" = " HWY",
+    " AVENUE" = " AVE", " STREET" = " ST", " PARKWAY" = " PKY",
+    " EXPRESSWAY" = " EXPY", " GATEWAY" = " GTWY", " PLAZA" = " PLZ",
+    " ROAD" = " RD", " SQUARE" = " SQ", " TERRACE" = " TER",
+    " DRIVE" = " DR", "TRAIL" = "TRL", "VILLAGE" = "VLG",
+    " NORTH " = " N ", " SOUTH " = " S ", " EAST " = " E ",
+    " WEST " = " W ", " APARTMENT" = " APT", " BUILDING" = " BLDG",
+    " FLOOR" = " FL", " ROOM" = " RM", " DEPARTMENT" = " DEPT",
+    " TRACE" = "TRCE", " PLACE" = " PL", " CIRCLE" = " CIR",
+    " COURT" = " CT", "NORTHWEST" = "NW", "NORTHEAST" = "NE",
+    "SOUTHWEST" = "SW", "SOUTHEAST" = "SE"
+  )
+
+  # process addresses
+  cleaned_data <- data %>%
+    mutate(across(everything(), toupper)) %>%
+    mutate(across(where(is.character), str_trim)) %>%
+    mutate(Zip = as.numeric(substr(Zip, start = 1, stop = 5))) %>%
+    mutate(across(c(Zip), ~ str_pad(., width = 5, pad = "0"))) %>%
+    mutate(Address = str_replace_all(Address, "[^[:alnum:]\\s]|\\u001B", "")) %>%
+    mutate(Address_number = safe_parse_number(Address)) %>%
+    mutate(Address = str_replace_all(Address, address_fix)) %>%
+    separate(Address,
+      into = c("Address", "Address 2"),
+      sep = "\\s*UNIT\\s* | \\s*BLDG\\s* | \\s*APT\\s* | \\s*RM\\s* | \\s*STE\\s* |
+      \\. | \\#", extra = "merge", fill = "right"
+    ) %>%
+    arrange(State, Zip, Address) %>%
+    drop_na(Address)
+
+  # return results
+  cleaned_data
+}
+```
+
+Define function to safely parse numbers from strings
+```{r}
+safe_parse_number <- function(x) {
+  numbers <- str_extract(x, "\\d+")
+  ifelse(is.na(numbers), NA_real_, as.numeric(numbers))
+}
+```
+
+
+Define function to find active clients in 2 data sets PestPac and iRIS
+```{r}
+find_active_clients <- function(client_file, pp_file, iris_file) {
+  client <- read.csv(client_file)
+
+  client <- clean_data(client)
+
+  # extract state from client file name
+  client_state <- substr(basename(client_file), 1, 2)
+
+  # check if PP or iRIS has been cleaned already
+  if (exists("cleaned_data_frames")) {
+    if (client_state %in% names(cleaned_data_frames)) {
+      pp_all_active <- cleaned_data_frames[[client_state]]$pp_active_cleaned
+      iris_all_active <- cleaned_data_frames[[client_state]]$iris_active_cleaned
+    } else {
+      pp_active <- read.csv(pp_file)
+      pp_active <- clean_data(pp_active)
+      # save cleaned pp data to list
+      cleaned_data_frames[[client_state]]$pp_active_cleaned <- pp_active
+
+      iris_active <- read.csv(iris_file)
+      iris_active <- clean_data(iris_active)
+      cleaned_data_frames[[client_state]]$iris_active_cleaned <- iris_active
+    }
+  } else {
+    # create new list to store cleaned data frames
+    cleaned_data_frames <- list()
+    pp_active <- read.csv(pp_file)
+    pp_active <- clean_data(pp_active)
+    cleaned_data_frames[[client_state]]$pp_active_cleaned <- pp_active
+
+    iris_active <- read.csv(iris_file)
+    iris_active <- clean_data(iris_active)
+    cleaned_data_frames[[client_state]]$iris_active_cleaned <- iris_active
+  }
+
+  # find active clients. Adjust max_dist for degree of fuzzyjoin desired
+  pp_active_client <- pp_active %>%
+    semi_join(client, by = c("State", "Zip")) %>%
+    semi_join(client, by = "Address_number") %>%
+    stringdist_inner_join(client, by = "Address", max_dist = 3, distance_col = "string_distance") %>%
+    filter(State.x == State.y, Zip.x == Zip.y, Address_number.x == Address_number.y)
+
+  iris_active_client <- iris_active %>%
+    semi_join(client, by = c("State", "Zip")) %>%
+    semi_join(client, by = "Address_number") %>%
+    stringdist_inner_join(client, by = "Address", max_dist = 3, distance_col = "string_distance") %>%
+    filter(State.x == State.y, Zip.x == Zip.y, Address_number.x == Address_number.y)
+
+  # return results
+  list(pp_active_client, iris_active_client)
+}
+```
+
+
+Get list of client files and loop through to find active clients
+```{r}
+# Reset active client if program ran previously
+pp_active_clients <- list()
+iris_active_clients <- list()
+
+# get file path
+client_folder <- "C:/Users/ivan.yuen/Documents/R/Client states"
+pp_folder <- "C:/Users/ivan.yuen/Documents/R/PP states"
+iris_folder <- "C:/Users/ivan.yuen/Documents/R/iRIS states"
+pp_results <- list()
+iris_results <- list()
+
+# get list of client files
+client_files <- list.files(client_folder, pattern = "*.csv", recursive = TRUE)
+
+# Loop through client files, look for active addresses, then store results
+for (client_file in client_files) {
+  # convert file name into file path
+  client_file <- file.path(client_folder, basename(client_file))
+  # Get file paths for matching PP and iRIS files
+  pp_file <- file.path(pp_folder, basename(client_file))
+  iris_file <- file.path(iris_folder, basename(client_file))
+
+  # Check if pp_file and iris_file exist before proceeding
+  client_state <- substr(basename(client_file), 1, 2)
+  if (file.exists(pp_file) && file.exists(iris_file)) {
+    active_clients <- find_active_clients(client_file, pp_file, iris_file)
+    pp_results[[client_file]] <- active_clients[[1]]
+    iris_results[[client_file]] <- active_clients[[2]]
+    
+  } else {
+  message(sprintf("Skipping state %s: matching files not found.", client_state))
+  }
+}
+
+#Combine results from each state
+pp_results <- pp_results %>%
+  bind_rows() %>%
+  mutate(row_number = as.integer(row_number))
+
+iris_results <- iris_results %>%
+  bind_rows() %>%
+  mutate(row_number = as.integer(row_number))
+
+#Pull data from all active files based on row numbers of matches
+pp_active_clients <- pp_all_active %>%
+  inner_join(pp_results, by = "row_number") %>%
+  select(-c(Address.x, `Address 2.x`,City.x,State.x,Zip.x,Address_number.x,Address_number.y)) %>%
+  arrange(State, Zip, Address)
+
+iris_active_clients <- iris_all_active %>%
+  inner_join(iris_results, by = "row_number") %>%
+  select(-c(Address.x, `Address 2.x`,City.x,State.x,Zip.x,Address_number.x,Address_number.y)) %>%
+  arrange(WKSSTATE, WKSZIP, WKSADDR1)
+
+ #Export 
+write_csv(pp_active_clients, "pp_active_clients.csv")
+write_csv(iris_active_clients, "iris_active_clients.csv")
+```
+
+Definite function to delete files in folder
+```{r}
+delete_files_in_folder <- function(folder) {
+  files <- list.files(folder, recursive = TRUE)
+  for (file in files) {
+    file_path <- file.path(folder, file)
+    if (file.exists(file_path)) {
+      file.remove(file_path)
+    }
+  }
+}
+```
+
+Remove current files to prepare for a different client input
+```{r}
+delete_files_in_folder("C:/Users/ivan.yuen/Documents/R/Client states")
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
