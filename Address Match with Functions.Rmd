@@ -321,7 +321,7 @@ write_csv(pp_active_clients, "pp_active_clients.csv")
 write_csv(iris_active_clients, "iris_active_clients.csv")
 ```
 
-Definite function to delete files in folder
+Define function to delete files in folder
 ```{r}
 delete_files_in_folder <- function(folder) {
   files <- list.files(folder, recursive = TRUE)
